@@ -30,6 +30,12 @@ class TipDataset(Dataset):
         self.label_encoder_tip2 = LabelEncoder()
         self.labels_tip2 = self.label_encoder_tip2.fit_transform(self.data['tip2'])
 
+        # 解析日期列并生成时间特征
+        self.dates = pd.to_datetime(self.data['date'], format='%Y%m%d')
+        self.months = self.dates.dt.month.values  # 提取月份
+        self.sin_month = np.sin(2 * np.pi * self.months / 12)  # 正弦编码月份
+        self.cos_month = np.cos(2 * np.pi * self.months / 12)  # 余弦编码月份
+
     def __len__(self):
         return len(self.data)
 
@@ -38,21 +44,36 @@ class TipDataset(Dataset):
         features = np.load(npy_location)
         label_tip1 = self.labels_tip1[idx]
         label_tip2 = self.labels_tip2[idx]
+
+        # 获取时间特征
+        sin_month = self.sin_month[idx]
+        cos_month = self.cos_month[idx]
+
         if self.transform:
             features = self.transform(features)
-        return torch.tensor(features, dtype=torch.float32), torch.tensor(label_tip1, dtype=torch.long), torch.tensor(label_tip2, dtype=torch.long)
+
+        # 返回影像特征和时间特征
+        return (
+            torch.tensor(features, dtype=torch.float32),
+            torch.tensor([sin_month, cos_month], dtype=torch.float32),  # 时间特征
+            torch.tensor(label_tip1, dtype=torch.long),
+            torch.tensor(label_tip2, dtype=torch.long)
+        )
 
 # 定义Transformer模型
 class TransformerModel(nn.Module):
     def __init__(self, input_dim, num_heads, num_layers, num_classes_tip1, num_classes_tip2):
         super(TransformerModel, self).__init__()
-        self.embedding = nn.Linear(input_dim, 512)
+        self.input_dim = input_dim
+        self.embedding = nn.Linear(input_dim + 2, 512)  # 输入维度增加2（sin_month, cos_month）
         encoder_layer = nn.TransformerEncoderLayer(d_model=512, nhead=num_heads, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.fc_tip1 = nn.Linear(512, num_classes_tip1)  # 输出 tip1 类别
         self.fc_tip2 = nn.Linear(512, num_classes_tip2)  # 输出 tip2 类别
 
-    def forward(self, x):
+    def forward(self, x, time_features):
+        # 拼接影像特征和时间特征
+        x = torch.cat((x, time_features), dim=-1)  # (batch_size, feature_dim + 2)
         x = self.embedding(x)
         x = x.unsqueeze(1)  # 添加序列维度 (batch_size, seq_len, embed_dim)
         x = self.transformer_encoder(x)
@@ -67,10 +88,10 @@ num_heads = 8
 num_layers = 8
 learning_rate = 0.0001
 num_epochs = 150
-batch_size = 64  # 设置batch_size
+batch_size = 128  # 设置batch_size
 
 # 数据加载
-csv_path = r"E:\postgraduate\小论文\小论文\表格文件\id_tips_date_features.csv"
+csv_path = r"E:\小论文\PY_project\for_tree_spieces_identification\id_tips_date_features.csv"
 dataset = TipDataset(csv_path)
 train_dataset, test_dataset = train_test_split(dataset, test_size=0.2, random_state=42)
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -87,13 +108,18 @@ optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 # 训练模型
 def train(model, device, train_loader, optimizer, criterion, epoch):
     model.train()
-    for batch_idx, (data, target_tip1, target_tip2) in enumerate(train_loader):
-        data, target_tip1, target_tip2 = data.to(device), target_tip1.to(device), target_tip2.to(device)
+    for batch_idx, (data, time_features, target_tip1, target_tip2) in enumerate(train_loader):
+        data, time_features, target_tip1, target_tip2 = (
+            data.to(device),
+            time_features.to(device),
+            target_tip1.to(device),
+            target_tip2.to(device)
+        )
         optimizer.zero_grad()
-        output_tip1, output_tip2 = model(data)
+        output_tip1, output_tip2 = model(data, time_features)
         loss_tip1 = criterion(output_tip1, target_tip1)
         loss_tip2 = criterion(output_tip2, target_tip2)
-        total_loss = 1.0 * loss_tip1 + 1.0 * loss_tip2  # 可以根据实际情况调整权重
+        total_loss = loss_tip1 + loss_tip2
         total_loss.backward()
         optimizer.step()
         if batch_idx % 10 == 0:
@@ -111,9 +137,14 @@ def test(model, device, test_loader, criterion, label_encoder_tip1, label_encode
     all_targets_tip2 = []
 
     with torch.no_grad():
-        for data, target_tip1, target_tip2 in test_loader:
-            data, target_tip1, target_tip2 = data.to(device), target_tip1.to(device), target_tip2.to(device)
-            output_tip1, output_tip2 = model(data)
+        for data, time_features, target_tip1, target_tip2 in test_loader:
+            data, time_features, target_tip1, target_tip2 = (
+                data.to(device),
+                time_features.to(device),
+                target_tip1.to(device),
+                target_tip2.to(device)
+            )
+            output_tip1, output_tip2 = model(data, time_features)
             loss_tip1 = criterion(output_tip1, target_tip1)
             loss_tip2 = criterion(output_tip2, target_tip2)
             test_loss += (loss_tip1 + loss_tip2).item()
@@ -163,5 +194,60 @@ if __name__ == "__main__":
         if accuracy_tip1 > best_accuracy_tip1 or accuracy_tip2 > best_accuracy_tip2:
             best_accuracy_tip1 = accuracy_tip1
             best_accuracy_tip2 = accuracy_tip2
-            torch.save(model.state_dict(), 'best_model_tips.pth')
+            torch.save(model.state_dict(), 'best_model.pth')
             print(f'Best model saved with accuracy tip1: {best_accuracy_tip1:.2f}%, accuracy tip2: {best_accuracy_tip2:.2f}%')
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+Test set: Average loss: 0.0175, Accuracy tip1: 82.03%, Accuracy tip2: 76.21%
+
+Classification Report for tip1:
+               precision    recall  f1-score   support
+
+         竹、灌       0.82      0.71      0.76      1675
+         针叶林       0.84      0.88      0.86     10694
+       针阔混交林       0.78      0.76      0.77      4796
+         阔叶林       0.80      0.77      0.79      4353
+
+    accuracy                           0.82     21518
+   macro avg       0.81      0.78      0.80     21518
+weighted avg       0.82      0.82      0.82     21518
+
+Classification Report for tip2:
+               precision    recall  f1-score   support
+
+     其他易燃针叶林       0.81      0.71      0.75        65
+     其他难燃阔叶林       0.80      0.72      0.76      1247
+         杉木林       0.76      0.82      0.79      6497
+         枫香林       0.70      0.72      0.71       487
+         柏木林       0.66      0.53      0.59       203
+         栎类林       0.73      0.74      0.74      1529
+         樟木林       0.79      0.75      0.77      1090
+        湿地松林       0.81      0.74      0.77       363
+         竹、灌       0.81      0.71      0.76      1675
+     针叶针阔混交林       0.77      0.76      0.76      4458
+     阔叶针阔混交林       0.75      0.67      0.71       338
+        马尾松林       0.75      0.74      0.75      3566
+
+    accuracy                           0.76     21518
+   macro avg       0.76      0.72      0.74     21518
+weighted avg       0.76      0.76      0.76     21518
+
+Confusion Matrix for tip1:
+ [[1185  274  121   95]
+ [ 134 9447  613  500]
+ [  66  841 3650  239]
+ [  65  623  295 3370]]
+Confusion Matrix for tip2:
+ [[  46    0    9    1    0    1    0    0    0    3    0    5]
+ [   0  892  138   11    1   30   17    3   19   80    7   49]
+ [   6   66 5322   36   18  123   69   21   80  390   21  345]
+ [   0    6   42  351    1   11    6    1   10   35    3   21]
+ [   1    4   41    2  107    3    0    0    3   24    0   18]
+ [   0   18  138   10    2 1137   19    4   26  118    5   52]
+ [   0   15   81    7    1   25  817    2   16   54    6   66]
+ [   0    1   37    3    1    8    5  267    8    9    0   24]
+ [   0   27  192   25    3   33   12    7 1191  121    4   60]
+ [   3   50  496   30   18  105   41    9   63 3393   19  231]
+ [   0    2   52    2    0    3    1    0    6   24  227   21]
+ [   1   33  455   25   10   80   48   17   55  184    9 2649]]
