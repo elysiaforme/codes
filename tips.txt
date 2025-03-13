@@ -1,422 +1,150 @@
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import classification_report
-from collections import defaultdict
-from tqdm import tqdm
-import chardet
-import warnings
+import numpy as np  
+import pandas as pd  
+import torch  
+import torch.nn as nn  
+import torch.optim as optim  
+from torch.utils.data import Dataset, DataLoader  
+from sklearn.model_selection import train_test_split  
+from sklearn.preprocessing import LabelEncoder  
+from sklearn.metrics import classification_report, confusion_matrix  
+import chardet  
+import os  
 
-warnings.filterwarnings('ignore')
+def detect_encoding(file_path):  
+    with open(file_path, 'rb') as f:  
+        raw_data = f.read()  
+    result = chardet.detect(raw_data)  
+    return result['encoding']  
 
-# ------------------------------
-# 1. 数据预处理模块
-# ------------------------------
-def detect_encoding(file_path):
-    with open(file_path, 'rb') as f:
-        raw_data = f.read(10000)
-    return chardet.detect(raw_data)['encoding']
-
-def data_preprocessing(csv_path):
-    # 加载数据
-    encoding = detect_encoding(csv_path)
-    df = pd.read_csv(csv_path, encoding=encoding)
+# 修改后的数据集类（不再包含LabelEncoder）
+class TipDataset(Dataset):  
+    def __init__(self, dataframe, transform=None):  
+        self.data = dataframe  
+        self.transform = transform  
+        
+    def __len__(self):  
+        return len(self.data)  
     
-    # 创建组合标签并验证
-    df['combo_label'] = df['tip1'].astype(str) + '_' + df['tip2'].astype(str)
-    combo_counts = df.groupby(['tip1', 'tip2']).size()
-    
-    # 处理稀疏组合（样本量<5自动降级）
-    if combo_counts.min() < 5:
-        print("警告：检测到稀疏组合，降级为单标签分层")
-        stratify_labels = df['tip1']
-    else:
-        stratify_labels = df['combo_label']
-    
-    # 划分数据集
-    train_df, test_df = train_test_split(
-        df, 
-        test_size=0.2, 
-        stratify=stratify_labels,
-        random_state=42
-    )
-    
-    # 标签编码
-    le_tip1 = LabelEncoder()
-    le_tip2 = LabelEncoder()
-    
-    train_tip1 = le_tip1.fit_transform(train_df['tip1'])
-    train_tip2 = le_tip2.fit_transform(train_df['tip2'])
-    
-    test_tip1 = le_tip1.transform(test_df['tip1'])
-    test_tip2 = le_tip2.transform(test_df['tip2'])
-    
-    # 计算标准化参数
-    train_features = [np.load(p).astype(np.float32) for p in train_df['npy_location']]
-    train_features = np.array(train_features)
-    mean = train_features.mean(axis=0)
-    std = train_features.std(axis=0)
-    
-    # 构建层级映射关系
-    tip1_to_tip2 = defaultdict(set)
-    for t1, t2 in zip(train_tip1, train_tip2):
-        tip1_to_tip2[t1].add(t2)
-    
-    return (
-        train_df, test_df, 
-        (train_tip1, test_tip1), (train_tip2, test_tip2),
-        le_tip1, le_tip2, mean, std, tip1_to_tip2
-    )
-
-# ------------------------------
-# 2. 数据集类
-# ------------------------------
-class SafeDataset(Dataset):
-    def __init__(self, df, tip1_labels, tip2_labels, mean, std):
-        self.df = df.reset_index(drop=True)
-        self.tip1_labels = tip1_labels
-        self.tip2_labels = tip2_labels
-        self.mean = mean
-        self.std = std
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        path = self.df.iloc[idx]['npy_location']
-        features = np.load(path).astype(np.float32)
-        features = (features - self.mean) / (self.std + 1e-8)
+    def __getitem__(self, idx):  
+        npy_location = self.data.iloc[idx]['npy_location']  
+        features = np.load(npy_location)  
+        label_tip1 = self.data.iloc[idx]['tip1_encoded']  # 直接读取预编码的标签
+        label_tip2 = self.data.iloc[idx]['tip2_encoded']  
+        if self.transform:  
+            features = self.transform(features)  
         return (
-            torch.tensor(features),
-            torch.tensor(self.tip1_labels[idx], dtype=torch.long),
-            torch.tensor(self.tip2_labels[idx], dtype=torch.long)
+            torch.tensor(features, dtype=torch.float32),
+            torch.tensor(label_tip1, dtype=torch.long),
+            torch.tensor(label_tip2, dtype=torch.long)
         )
 
-# ------------------------------
-# 3. 模型架构
-# ------------------------------
-class EnhancedTransformer(nn.Module):
-    def __init__(self, input_dim, num_heads, num_layers, num_tip1, num_tip2):
-        super().__init__()
-        self.embed = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, 512)
-        )
-        
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=512,
-            nhead=num_heads,
-            dim_feedforward=2048,
-            dropout=0.1,
-            batch_first=True
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
-        
-        self.tip1_head = nn.Linear(512, num_tip1)
-        self.tip2_head = nn.Linear(512, num_tip2)
+# ----------- 数据预处理流程修改 -----------
+csv_path = r"E:\postgraduate\小论文\小论文\表格文件\id_tips_date_features.csv"  
 
-    def forward(self, x):
-        x = self.embed(x)
-        x = x.unsqueeze(1)  # [batch, 1, 512]
-        x = self.encoder(x)
-        x = x.squeeze(1)
-        return self.tip1_head(x), self.tip2_head(x)
+# 1. 读取数据
+encoding = detect_encoding(csv_path)
+full_data = pd.read_csv(csv_path, encoding=encoding)
 
-# ------------------------------
-# 4. 训练组件
-# ------------------------------
-class HierarchicalLoss(nn.Module):
-    def __init__(self, alpha=0.7, penalty=0.1):
-        super().__init__()
-        self.alpha = alpha
-        self.penalty = penalty
+# 2. 先分割数据再编码（避免数据泄露）
+train_df, test_df = train_test_split(full_data, test_size=0.2, random_state=42)
 
-    def forward(self, outputs, targets):
-        tip1_out, tip2_out = outputs
-        tip1_true, tip2_true = targets
-        
-        # 基础损失
-        loss_tip1 = F.cross_entropy(tip1_out, tip1_true)
-        loss_tip2 = F.cross_entropy(tip2_out, tip2_true)
-        
-        # 层级一致性惩罚
-        with torch.no_grad():
-            tip1_pred = tip1_out.argmax(dim=1)
-            mask = (tip1_pred != tip1_true).float()
-        
-        penalty_term = mask * F.mse_loss(
-            tip2_out, 
-            F.one_hot(tip2_true, num_classes=tip2_out.size(1)).float(),
-            reduction='none'
-        ).mean(dim=1)
-        
-        total_loss = (self.alpha * loss_tip1 
-                     + (1 - self.alpha) * loss_tip2 
-                     + self.penalty * penalty_term.mean())
-        return total_loss
+# 3. 在训练集上拟合编码器
+label_encoder_tip1 = LabelEncoder()
+label_encoder_tip2 = LabelEncoder()
 
-class EarlyStopping:
-    def __init__(self, patience=10, delta=0.001, mode='min'):
-        self.patience = patience
-        self.delta = delta
-        self.mode = mode
-        self.counter = 0
-        self.best_metric = np.inf if mode == 'min' else -np.inf
+# 创建编码后的列（原始列保留以便调试）
+train_df['tip1_encoded'] = label_encoder_tip1.fit_transform(train_df['tip1'])
+train_df['tip2_encoded'] = label_encoder_tip2.fit_transform(train_df['tip2'])
 
-    def __call__(self, current_metric):
-        if self.mode == 'min':
-            improve = (current_metric < self.best_metric - self.delta)
-        else:
-            improve = (current_metric > self.best_metric + self.delta)
+# 测试集使用训练集的编码器转换
+test_df['tip1_encoded'] = label_encoder_tip1.transform(test_df['tip1'])
+test_df['tip2_encoded'] = label_encoder_tip2.transform(test_df['tip2'])
 
-        if improve:
-            self.best_metric = current_metric
-            self.counter = 0
-        else:
-            self.counter += 1
+# 4. 创建数据集
+train_dataset = TipDataset(train_df)
+test_dataset = TipDataset(test_df)
 
-        return self.counter >= self.patience
+# ----------- 测试函数修正 -----------
+def test(model, device, test_loader, criterion, label_encoder_tip1, label_encoder_tip2):  
+    model.eval()  
+    test_loss = 0  
+    correct_tip1 = 0  
+    correct_tip2 = 0  
+    all_preds_tip1 = []  
+    all_targets_tip1 = []  
+    all_preds_tip2 = []  
+    all_targets_tip2 = []  
 
-def hierarchical_metrics(tip1_pred, tip2_pred, tip1_true, tip2_true, tip1_to_tip2):
-    tip1_pred = tip1_pred.cpu().numpy()
-    tip2_pred = tip2_pred.cpu().numpy()
-    tip1_true = tip1_true.cpu().numpy()
-    tip2_true = tip2_true.cpu().numpy()
-
-    exact_acc = np.mean((tip1_pred == tip1_true) & (tip2_pred == tip2_true))
-    tip1_acc = np.mean(tip1_pred == tip1_true)
-    
-    valid_count = 0
-    for t1_true, t2_pred in zip(tip1_true, tip2_pred):
-        valid_count += t2_pred in tip1_to_tip2[t1_true]
-    
-    return {
-        'exact_acc': exact_acc,
-        'tip1_acc': tip1_acc,
-        'valid_subclass': valid_count / len(tip1_true)
-    }
-
-# ------------------------------
-# 5. 训练流程
-# ------------------------------
-def train_epoch(model, loader, optimizer, criterion, device, tip1_to_tip2):
-    model.train()
-    total_loss = 0.0
-    metrics = defaultdict(float)
-    
-    for inputs, tip1, tip2 in tqdm(loader, desc="Training"):
-        inputs = inputs.to(device)
-        tip1 = tip1.to(device)
-        tip2 = tip2.to(device)
-        
-        optimizer.zero_grad()
-        tip1_out, tip2_out = model(inputs)
-        
-        loss = criterion((tip1_out, tip2_out), (tip1, tip2))
-        loss.backward()
-        optimizer.step()
-        
-        # 计算指标
-        with torch.no_grad():
-            tip1_pred = tip1_out.argmax(dim=1)
-            tip2_pred = tip2_out.argmax(dim=1)
-            batch_metrics = hierarchical_metrics(tip1_pred, tip2_pred, tip1, tip2, tip1_to_tip2)
-        
-        total_loss += loss.item()
-        for k, v in batch_metrics.items():
-            metrics[k] += v * inputs.size(0)
-    
-    num_samples = len(loader.dataset)
-    return {
-        'loss': total_loss / len(loader),
-        **{k: v / num_samples for k, v in metrics.items()}
-    }
-
-def validate(model, loader, criterion, device, tip1_to_tip2, le1, le2):
-    model.eval()
-    total_loss = 0.0
-    metrics = defaultdict(float)
-    all_tip1 = []
-    all_tip2 = []
-    all_pred1 = []
-    all_pred2 = []
-    
-    with torch.no_grad():
-        for inputs, tip1, tip2 in tqdm(loader, desc="Validation"):
-            inputs = inputs.to(device)
-            tip1 = tip1.to(device)
-            tip2 = tip2.to(device)
+    with torch.no_grad():  
+        for data, target_tip1, target_tip2 in test_loader:  
+            data, target_tip1, target_tip2 = data.to(device), target_tip1.to(device), target_tip2.to(device)  
+            output_tip1, output_tip2 = model(data)  
             
-            tip1_out, tip2_out = model(inputs)
-            loss = criterion((tip1_out, tip2_out), (tip1, tip2))
-            
-            tip1_pred = tip1_out.argmax(dim=1)
-            tip2_pred = tip2_out.argmax(dim=1)
-            
-            # 收集预测结果
-            all_tip1.extend(tip1.cpu().numpy())
-            all_tip2.extend(tip2.cpu().numpy())
-            all_pred1.extend(tip1_pred.cpu().numpy())
-            all_pred2.extend(tip2_pred.cpu().numpy())
-            
-            # 计算指标
-            batch_metrics = hierarchical_metrics(tip1_pred, tip2_pred, tip1, tip2, tip1_to_tip2)
-            
-            total_loss += loss.item()
-            for k, v in batch_metrics.items():
-                metrics[k] += v * inputs.size(0)
-    
-    # 生成分类报告
-    tip1_report = classification_report(
-        all_tip1, all_pred1,
-        target_names=le1.classes_,
-        output_dict=True
-    )
-    tip2_report = classification_report(
-        all_tip2, all_pred2,
-        target_names=le2.classes_,
-        output_dict=True
-    )
-    
-    num_samples = len(loader.dataset)
-    return {
-        'loss': total_loss / len(loader),
-        **{k: v / num_samples for k, v in metrics.items()},
-        'tip1_report': tip1_report,
-        'tip2_report': tip2_report
-    }
+            # 修正损失计算：每个batch计算的是平均损失
+            loss_tip1 = criterion(output_tip1, target_tip1)  
+            loss_tip2 = criterion(output_tip2, target_tip2)  
+            test_loss += (loss_tip1.item() + loss_tip2.item())  # 累加batch的平均损失  
 
-# ------------------------------
-# 主程序
-# ------------------------------
-def main():
-    # 配置参数
-    config = {
-        "csv_path": "your_dataset.csv",
-        "input_dim": 64,
-        "num_heads": 8,
-        "num_layers": 6,
-        "batch_size": 128,
-        "lr": 3e-4,
-        "weight_decay": 1e-5,
-        "epochs": 100,
-        "patience": 10,
-        "loss_alpha": 0.7,
-        "penalty_weight": 0.1
-    }
-    
-    # 数据准备
-    (train_df, test_df, 
-     (train_tip1, test_tip1), (train_tip2, test_tip2),
-     le1, le2, mean, std, tip1_map) = data_preprocessing(config["csv_path"])
-    
-    # 创建数据集
-    train_set = SafeDataset(train_df, train_tip1, train_tip2, mean, std)
-    test_set = SafeDataset(test_df, test_tip1, test_tip2, mean, std)
-    
-    # 数据加载器
-    train_loader = DataLoader(
-        train_set,
-        batch_size=config["batch_size"],
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
-    )
-    test_loader = DataLoader(
-        test_set,
-        batch_size=config["batch_size"]*2,
-        num_workers=4,
-        pin_memory=True
-    )
-    
-    # 模型初始化
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = EnhancedTransformer(
-        input_dim=config["input_dim"],
-        num_heads=config["num_heads"],
-        num_layers=config["num_layers"],
-        num_tip1=len(le1.classes_),
-        num_tip2=len(le2.classes_)
-    ).to(device)
-    
-    # 优化器与损失函数
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config["lr"],
-        weight_decay=config["weight_decay"]
-    )
-    criterion = HierarchicalLoss(
-        alpha=config["loss_alpha"],
-        penalty=config["penalty_weight"]
-    )
-    
-    # 早停机制
-    early_stopping = EarlyStopping(
-        patience=config["patience"],
-        mode='max',  # 监控exact_acc
-        delta=0.001
-    )
-    
-    # 训练循环
-    best_exact_acc = 0.0
-    for epoch in range(1, config["epochs"]+1):
-        print(f"\nEpoch {epoch}/{config['epochs']}")
-        
-        # 训练阶段
-        train_results = train_epoch(
-            model, train_loader, optimizer, criterion, 
-            device, tip1_map
-        )
-        
-        # 验证阶段
-        val_results = validate(
-            model, test_loader, criterion, device, 
-            tip1_map, le1, le2
-        )
-        
-        # 打印指标
-        print(f"Train Loss: {train_results['loss']:.4f} | "
-              f"Exact Acc: {train_results['exact_acc']:.2%}")
-        print(f"Val Loss: {val_results['loss']:.4f} | "
-              f"Exact Acc: {val_results['exact_acc']:.2%} | "
-              f"Valid Subclass: {val_results['valid_subclass']:.2%}")
-        
-        # 早停判断
-        if early_stopping(-val_results['exact_acc']):
-            print("早停触发，终止训练")
-            break
-        
-        # 保存最佳模型
-        if val_results['exact_acc'] > best_exact_acc:
-            best_exact_acc = val_results['exact_acc']
-            torch.save(model.state_dict(), "best_model.pth")
-            print(f"保存新最佳模型，准确率：{best_exact_acc:.2%}")
-    
-    # 最终评估
-    print("\n最佳模型评估结果：")
-    model.load_state_dict(torch.load("best_model.pth"))
-    final_results = validate(model, test_loader, criterion, device, tip1_map, le1, le2)
-    
-    print("\n大类分类报告：")
-    print(classification_report(
-        final_results['tip1_report']['accuracy'],
-        target_names=le1.classes_,
-        digits=4
-    ))
-    
-    print("\n子类分类报告：")
-    print(classification_report(
-        final_results['tip2_report']['accuracy'], 
-        target_names=le2.classes_,
-        digits=4
-    ))
+            # 原有准确率计算保持不变...
+            pred_tip1 = output_tip1.argmax(dim=1, keepdim=True)  
+            pred_tip2 = output_tip2.argmax(dim=1, keepdim=True)  
 
-if __name__ == "__main__":
-    main()
+            correct_tip1 += pred_tip1.eq(target_tip1.view_as(pred_tip1)).sum().item()  
+            correct_tip2 += pred_tip2.eq(target_tip2.view_as(pred_tip2)).sum().item()  
+
+            all_preds_tip1.extend(pred_tip1.cpu().numpy().flatten())  
+            all_targets_tip1.extend(target_tip1.cpu().numpy())  
+            all_preds_tip2.extend(pred_tip2.cpu().numpy().flatten())  
+            all_targets_tip2.extend(target_tip2.cpu().numpy())  
+
+    # 关键修正：总损失 = 各batch平均损失之和 / batch数量
+    test_loss /= len(test_loader)  # 不再是 len(test_loader.dataset)
+    
+    accuracy_tip1 = 100. * correct_tip1 / len(test_loader.dataset)  
+    accuracy_tip2 = 100. * correct_tip2 / len(test_loader.dataset)  
+    print(f'\nTest set: Average loss: {test_loss:.4f}, Accuracy tip1: {accuracy_tip1:.2f}%, Accuracy tip2: {accuracy_tip2:.2f}%\n')  
+
+    # 分类报告使用训练集的classes_
+    class_names_tip1 = label_encoder_tip1.classes_  
+    class_names_tip2 = label_encoder_tip2.classes_  
+
+    # 原有报告生成逻辑保持不变...
+    report_tip1 = classification_report(all_targets_tip1, all_preds_tip1, target_names=class_names_tip1, zero_division=0)  
+    print("Classification Report for tip1:\n", report_tip1)  
+
+    report_tip2 = classification_report(all_targets_tip2, all_preds_tip2, target_names=class_names_tip2, zero_division=0)  
+    print("Classification Report for tip2:\n", report_tip2)  
+
+    cm_tip1 = confusion_matrix(all_targets_tip1, all_preds_tip1)  
+    print("Confusion Matrix for tip1:\n", cm_tip1)  
+
+    cm_tip2 = confusion_matrix(all_targets_tip2, all_preds_tip2)  
+    print("Confusion Matrix for tip2:\n", cm_tip2)  
+
+    return accuracy_tip1, accuracy_tip2  
+
+# ----------- 主函数调整 -----------
+if __name__ == "__main__":  
+    # 数据加载器（保持不变）
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)  
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)  
+
+    # 模型初始化（注意类别数使用编码后的类别数）
+    model = TransformerModel(
+        input_dim, 
+        num_heads, 
+        num_layers,
+        num_classes_tip1=len(label_encoder_tip1.classes_),  # 使用训练集的类别数
+        num_classes_tip2=len(label_encoder_tip2.classes_)
+    ).to(device)  
+
+    # 训练和测试循环（保持不变）
+    best_accuracy_tip1 = 0.0  
+    best_accuracy_tip2 = 0.0  
+    for epoch in range(1, num_epochs + 1):  
+        train(model, device, train_loader, optimizer, criterion, epoch)  
+        accuracy_tip1, accuracy_tip2 = test(
+            model, device, test_loader, criterion, 
+            label_encoder_tip1, label_encoder_tip2  # 传入训练集的编码器
+        )  
+        # 原有模型保存逻辑保持不变...
